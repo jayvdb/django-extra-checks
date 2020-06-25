@@ -1,3 +1,4 @@
+import importlib
 import site
 from functools import partial
 from typing import (
@@ -5,10 +6,12 @@ from typing import (
     Any,
     Callable,
     Dict,
+    Iterable,
     Iterator,
     List,
     Optional,
     Sequence,
+    Set,
     Type,
     Union,
 )
@@ -22,6 +25,11 @@ from django.db import models
 from . import _IGNORED, CheckId
 from .ast import FieldAST, ModelAST
 from .forms import ConfigForm
+
+try:
+    from rest_framework import serializers
+except ImportError:
+    serializers = None  # type: ignore
 
 if TYPE_CHECKING:
     from .checks import BaseCheck
@@ -63,8 +71,12 @@ class Registry:
             f(controller.check_extra_checks_health), "extra_checks_selfcheck"
         )
         django.core.checks.register(
-            f(controller.check_models), django.core.checks.Tags.models
+            f(controller.check_drf_serializers), django.core.checks.Tags.models
         )
+        if serializers:
+            django.core.checks.register(
+                f(controller.check_extra_checks_health), "extra_checks_drf_serializer"
+            )
 
         return controller
 
@@ -149,6 +161,57 @@ class ChecksController:
                     field_ast = FieldAST(node)
                     for check in field_checks:
                         yield from check(field, field_ast=field_ast, model=model)
+
+    def _collect_serializers(
+        self,
+        ss: Iterable[Type["serializers.Serializer"]],
+        visited: Optional[Set[Type["serializers.Serializer"]]] = None,
+    ) -> Iterator[Type["serializers.Serializer"]]:
+        visited = visited or set()
+        for serializer in ss:
+            if serializer not in visited:
+                visited.add(serializer)
+                yield from self._collect_serializers(
+                    serializer.__subclasses__(), visited
+                )
+                yield serializer
+
+    def _filter_app_serializers(
+        self, ss: Iterable[Type["serializers.Serializer"]]
+    ) -> Iterator[Type["serializers.Serializer"]]:
+        site_prefixes = set(site.PREFIXES)
+        for s in ss:
+            module = importlib.import_module(s.__module__)
+            if not any(module.__file__.startswith(path) for path in site_prefixes):
+                yield s
+
+    def check_drf_serializers(
+        self, app_configs: Optional[List[Any]] = None, **kwargs: Any
+    ) -> Iterator[Any]:
+        serializer_classes = self._filter_app_serializers(
+            self._collect_serializers(
+                s
+                for s in serializers.Serializer.__subclasses__()
+                if s is not serializers.ModelSerializer
+            )
+        )
+        model_serializer_classes = self._filter_app_serializers(
+            self._collect_serializers(serializers.ModelSerializer.__subclasses__())
+        )
+        model_checks = []
+        checks = []
+        for check in self.registered_checks.get("extra_checks_drf_serializer", []):
+            if isinstance(check, serializers.ModelSerializer):
+                model_checks.append(check)
+            else:
+                checks.append(check)
+        for s in model_serializer_classes:
+            for check in model_checks:
+                yield from check(s)
+        for s in serializer_classes:
+            for check in checks:
+                yield from check(s)
+        return []
 
 
 registry = Registry()

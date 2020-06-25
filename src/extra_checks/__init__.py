@@ -15,6 +15,7 @@ class CheckId(str, enum.Enum):
     X056 = "field-boolean-null"
     X057 = "field-null"
     X058 = "field-foreign-key-db-index"
+    X301 = "drf-serializer-extra-kwargs"
 
 
 _IGNORED = {}
